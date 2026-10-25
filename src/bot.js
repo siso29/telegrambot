@@ -1,6 +1,7 @@
 
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
+import { pool, initializeDatabase } from './db.js';
 
 const token = process.env.BOT_TOKEN;
 
@@ -301,8 +302,8 @@ const courses = {
 
 // --------------------------------------------------
 // 3. LEARNER DATA
-// This is temporary memory. It resets when the bot
-// restarts. A database can be added later.
+// PostgreSQL stores learner preferences, enrollments,
+// completed lessons, and quiz attempts.
 // --------------------------------------------------
 
 const learners = new Map();
@@ -321,6 +322,57 @@ function getLearner(userId) {
   }
 
   return learners.get(userId);
+}
+
+async function loadLearnerFromDatabase(userId) {
+  await pool.query(
+    `INSERT INTO learners (telegram_id)
+     VALUES ($1)
+     ON CONFLICT (telegram_id) DO NOTHING`,
+    [userId],
+  );
+
+  const savedLearner = await pool.query(
+    'SELECT language FROM learners WHERE telegram_id = $1',
+    [userId],
+  );
+
+  const learner = getLearner(userId);
+  learner.language = savedLearner.rows[0]?.language ?? 'en';
+
+  const enrollmentResult = await pool.query(
+    'SELECT course_key FROM enrollments WHERE telegram_id = $1',
+    [userId],
+  );
+
+  learner.enrolled = new Set(
+    enrollmentResult.rows.map((row) => row.course_key),
+  );
+
+  const progressResult = await pool.query(
+    `SELECT course_key, lesson_index
+     FROM lesson_progress
+     WHERE telegram_id = $1`,
+    [userId],
+  );
+
+  learner.completed = { g: new Set(), v: new Set() };
+  learner.progress = { g: 0, v: 0 };
+
+  for (const row of progressResult.rows) {
+    const courseKey = row.course_key;
+    const lessonIndex = Number(row.lesson_index);
+
+    if (learner.completed[courseKey]) {
+      learner.completed[courseKey].add(lessonIndex);
+      learner.progress[courseKey] = Math.max(
+        learner.progress[courseKey],
+        lessonIndex + 1,
+      );
+    }
+  }
+
+  return learner;
 }
 
 function courseTitle(courseKey, language) {
@@ -348,7 +400,7 @@ async function showLanguageMenu(ctx) {
 }
 
 bot.start(async (ctx) => {
-  getLearner(String(ctx.from.id));
+  await loadLearnerFromDatabase(String(ctx.from.id));
   await showLanguageMenu(ctx);
 });
 
@@ -356,9 +408,14 @@ bot.action(/^lang_(en|am|om)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const language = ctx.match[1];
-  const learner = getLearner(String(ctx.from.id));
+  const learner = await loadLearnerFromDatabase(String(ctx.from.id));
 
   learner.language = language;
+
+  await pool.query(
+    'UPDATE learners SET language = $1 WHERE telegram_id = $2',
+    [language, String(ctx.from.id)],
+  );
 
   await ctx.reply(
     L(
@@ -377,7 +434,7 @@ bot.action(/^lang_(en|am|om)$/, async (ctx) => {
 // --------------------------------------------------
 
 async function showMenu(ctx) {
-  const learner = getLearner(String(ctx.from.id));
+  const learner = await loadLearnerFromDatabase(String(ctx.from.id));
   const language = learner.language;
 
   const keyboard = Markup.inlineKeyboard([
@@ -442,7 +499,7 @@ bot.action(/^course_([gv])$/, async (ctx) => {
 });
 
 async function showCourse(ctx, courseKey) {
-  const learner = getLearner(String(ctx.from.id));
+  const learner = await loadLearnerFromDatabase(String(ctx.from.id));
   const language = learner.language;
   const course = courses[courseKey];
 
@@ -519,10 +576,17 @@ bot.action(/^enroll_([gv])$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const courseKey = ctx.match[1];
-  const learner = getLearner(String(ctx.from.id));
+  const learner = await loadLearnerFromDatabase(String(ctx.from.id));
   const language = learner.language;
 
   learner.enrolled.add(courseKey);
+
+  await pool.query(
+    `INSERT INTO enrollments (telegram_id, course_key)
+     VALUES ($1, $2)
+     ON CONFLICT (telegram_id, course_key) DO NOTHING`,
+    [String(ctx.from.id), courseKey],
+  );
 
   await ctx.reply(
     L(
@@ -540,9 +604,16 @@ bot.action(/^continue_([gv])$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   const courseKey = ctx.match[1];
-  const learner = getLearner(String(ctx.from.id));
+  const learner = await loadLearnerFromDatabase(String(ctx.from.id));
 
   learner.enrolled.add(courseKey);
+
+  await pool.query(
+    `INSERT INTO enrollments (telegram_id, course_key)
+     VALUES ($1, $2)
+     ON CONFLICT (telegram_id, course_key) DO NOTHING`,
+    [String(ctx.from.id), courseKey],
+  );
 
   let lessonIndex = learner.progress[courseKey];
 
@@ -559,7 +630,7 @@ bot.action(/^continue_([gv])$/, async (ctx) => {
 // --------------------------------------------------
 
 async function sendLesson(ctx, courseKey, lessonIndex) {
-  const learner = getLearner(String(ctx.from.id));
+  const learner = await loadLearnerFromDatabase(String(ctx.from.id));
   const language = learner.language;
   const course = courses[courseKey];
 
@@ -640,7 +711,7 @@ bot.action(/^quiz_([gv])_(\d+)$/, async (ctx) => {
   const courseKey = ctx.match[1];
   const lessonIndex = Number(ctx.match[2]);
 
-  const learner = getLearner(String(ctx.from.id));
+  const learner = await loadLearnerFromDatabase(String(ctx.from.id));
   const language = learner.language;
   const lesson = courses[courseKey].lessons[lessonIndex];
 
@@ -683,7 +754,7 @@ bot.action(/^answer_([gv])_(\d+)_(\d+)$/, async (ctx) => {
   const lessonIndex = Number(ctx.match[2]);
   const answerIndex = Number(ctx.match[3]);
 
-  const learner = getLearner(String(ctx.from.id));
+  const learner = await loadLearnerFromDatabase(String(ctx.from.id));
   const language = learner.language;
   const course = courses[courseKey];
   const lesson = course.lessons[lessonIndex];
@@ -695,8 +766,28 @@ bot.action(/^answer_([gv])_(\d+)_(\d+)$/, async (ctx) => {
     return;
   }
 
+  await pool.query(
+    `INSERT INTO quiz_attempts
+       (telegram_id, course_key, lesson_index, selected_answer, is_correct)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [
+      String(ctx.from.id),
+      courseKey,
+      lessonIndex,
+      answerIndex,
+      answerIndex === lesson.correct,
+    ],
+  );
+
   if (answerIndex === lesson.correct) {
     learner.completed[courseKey].add(lessonIndex);
+
+    await pool.query(
+      `INSERT INTO lesson_progress (telegram_id, course_key, lesson_index)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (telegram_id, course_key, lesson_index) DO NOTHING`,
+      [String(ctx.from.id), courseKey, lessonIndex],
+    );
 
     learner.progress[courseKey] = Math.max(
       learner.progress[courseKey],
@@ -746,7 +837,7 @@ bot.action(/^answer_([gv])_(\d+)_(\d+)$/, async (ctx) => {
 bot.action('my_progress', async (ctx) => {
   await ctx.answerCbQuery();
 
-  const learner = getLearner(String(ctx.from.id));
+  const learner = await loadLearnerFromDatabase(String(ctx.from.id));
   const language = learner.language;
 
   const lines = [
@@ -791,7 +882,7 @@ bot.action('my_progress', async (ctx) => {
 // --------------------------------------------------
 
 bot.command('help', async (ctx) => {
-  const learner = getLearner(String(ctx.from.id));
+  const learner = await loadLearnerFromDatabase(String(ctx.from.id));
   const language = learner.language;
 
   await ctx.reply(
@@ -812,15 +903,33 @@ bot.catch((error, ctx) => {
   console.error(`Bot error for update ${ctx.update.update_id}:`, error);
 });
 
-bot.launch()
-  .then(() => {
+async function startBot() {
+  try {
+    await initializeDatabase();
+    console.log('Database tables are ready.');
+
+    await bot.launch();
+
     console.log('Telegram Skills Academy bot is running!');
     console.log('Supported languages: English, Amharic, Afaan Oromoo');
-  })
-  .catch((error) => {
+  } catch (error) {
     console.error('Could not start the bot:', error.message);
+    await pool.end().catch(() => {});
     process.exit(1);
-  });
+  }
+}
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+async function shutdown(signal) {
+  bot.stop(signal);
+
+  try {
+    await pool.end();
+  } catch (error) {
+    console.error('Error closing database connection:', error.message);
+  }
+}
+
+startBot();
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
